@@ -105,8 +105,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut enc = Encoder::new();
 
-    // Set up arithmetic coding context(s)
-    let mut pixel_difference_pdf = VectorCountSymbolModel::new((0..=255).collect());
+    // Two adaptive symbol models:
+    //   intra_pdf  — used for frame 0 (no prior frame), predicts each pixel
+    //                from its left neighbor in the current frame (spatial prediction).
+    //   inter_pdf  — used for all subsequent frames, predicts each pixel from
+    //                the same pixel in the prior frame (temporal prediction) refined
+    //                by also subtracting the left neighbor's temporal difference
+    //                (spatial-temporal prediction).
+    let mut intra_pdf = VectorCountSymbolModel::new((0..=255).collect());
+    let mut inter_pdf = VectorCountSymbolModel::new((0..=255).collect());
+
+    let mut frame_index = 0u32; // counts frames actually encoded (after skipping)
 
     // Process frames
     for frame in iter.filter_frames() {
@@ -123,22 +132,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for r in 0..height {
                 for c in 0..width {
                     let pixel_index = (r * width + c) as usize;
+                    let current_val = current_frame[pixel_index] as i32;
 
-                    // Encode difference with same pixel in prior frame.
-                    // Normalize and modulate difference to 8-bit range.
-                    let pixel_difference = (((current_frame[pixel_index] as i32)
-                        - (prior_frame[pixel_index] as i32))
-                        + 256)
-                        % 256;
+                    let residual = if frame_index == 0 {
+                        // Intra frame: predict from left neighbor (or 128 for first column).
+                        let left_val = if c == 0 {
+                            128i32
+                        } else {
+                            current_frame[pixel_index - 1] as i32
+                        };
+                        let prediction = left_val;
+                        ((current_val - prediction) + 256) % 256
+                    } else {
+                        // Inter frame: predict from the co-located pixel in the prior frame,
+                        // then further refine using the left neighbor's temporal difference
+                        // as a spatial correction (reduces residual entropy significantly).
+                        let temporal_pred = prior_frame[pixel_index] as i32;
+                        let left_temporal_diff = if c == 0 {
+                            0i32
+                        } else {
+                            // difference already encoded for the pixel to our left this frame
+                            current_frame[pixel_index - 1] as i32
+                                - prior_frame[pixel_index - 1] as i32
+                        };
+                        let prediction = (temporal_pred + left_temporal_diff).clamp(0, 255);
+                        ((current_val - prediction) + 256) % 256
+                    };
 
-                    enc.encode(&pixel_difference, &pixel_difference_pdf, &mut bw);
-
-                    // Update context
-                    pixel_difference_pdf.incr_count(&pixel_difference);
+                    if frame_index == 0 {
+                        enc.encode(&residual, &intra_pdf, &mut bw);
+                        intra_pdf.incr_count(&residual);
+                    } else {
+                        enc.encode(&residual, &inter_pdf, &mut bw);
+                        inter_pdf.incr_count(&residual);
+                    }
                 }
             }
 
             prior_frame = current_frame;
+            frame_index += 1;
 
             let bits_written_at_end = enc.bits_written();
 
@@ -178,10 +210,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut dec = Decoder::new();
 
-        let mut pixel_difference_pdf = VectorCountSymbolModel::new((0..=255).collect());
+        let mut dec_intra_pdf = VectorCountSymbolModel::new((0..=255).collect());
+        let mut dec_inter_pdf = VectorCountSymbolModel::new((0..=255).collect());
 
         // Set up initial prior frame as uniform medium gray
         let mut prior_frame = vec![128 as u8; (width * height) as usize];
+        let mut dec_frame_index = 0u32;
 
         'outer_loop: 
         for frame in iter.filter_frames() {
@@ -191,15 +225,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 let current_frame: Vec<u8> = frame.data; // <- raw pixel y values
+                let mut reconstructed = vec![0u8; (width * height) as usize];
 
                 // Process pixels in row major order.
                 for r in 0..height {
                     for c in 0..width {
                         let pixel_index = (r * width + c) as usize;
-                        let decoded_pixel_difference = dec.decode(&pixel_difference_pdf, &mut br).to_owned();
-                        pixel_difference_pdf.incr_count(&decoded_pixel_difference);
 
-                        let pixel_value = (prior_frame[pixel_index] as i32 + decoded_pixel_difference) % 256;
+                        let residual = if dec_frame_index == 0 {
+                            let decoded = dec.decode(&dec_intra_pdf, &mut br).to_owned();
+                            dec_intra_pdf.incr_count(&decoded);
+                            decoded
+                        } else {
+                            let decoded = dec.decode(&dec_inter_pdf, &mut br).to_owned();
+                            dec_inter_pdf.incr_count(&decoded);
+                            decoded
+                        };
+
+                        let prediction = if dec_frame_index == 0 {
+                            let left_val = if c == 0 {
+                                128i32
+                            } else {
+                                reconstructed[pixel_index - 1] as i32
+                            };
+                            left_val
+                        } else {
+                            let temporal_pred = prior_frame[pixel_index] as i32;
+                            let left_temporal_diff = if c == 0 {
+                                0i32
+                            } else {
+                                reconstructed[pixel_index - 1] as i32
+                                    - prior_frame[pixel_index - 1] as i32
+                            };
+                            (temporal_pred + left_temporal_diff).clamp(0, 255)
+                        };
+
+                        let pixel_value = (prediction + residual) % 256;
+                        reconstructed[pixel_index] = pixel_value as u8;
 
                         if pixel_value != current_frame[pixel_index] as i32 {
                             println!(
@@ -212,7 +274,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 println!("correct.");
-                prior_frame = current_frame;
+                prior_frame = reconstructed;
+                dec_frame_index += 1;
             } else {
                 break 'outer_loop;
             }
